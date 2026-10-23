@@ -1,0 +1,186 @@
+<#
+.SYNOPSIS
+Deploys the lab resources scoped to a subscription or resource group.
+.DESCRIPTION
+Provides a controlled deployment flow for lab environments, optionally limited to a resource group and specific Entra user IDs.
+.PARAMETER DeploymentType
+Defines the deployment scope; allowed values are subscription or resourcegroup.
+.PARAMETER SubscriptionId
+Specifies the Azure subscription that contains the lab resources.
+.PARAMETER ResourceGroupName
+In case of resourcegroup deployment, specifies the target resource group name.
+.PARAMETER PreferredLocation
+Specifies the preferred Azure regions (ordered by preference) for resource deployment. An empty array indicates no preference.
+.PARAMETER AllowedEntraUserIds
+Optional list of Entra user object IDs permitted to access the lab resources.
+#>
+param(
+    [Parameter(Mandatory=$true)]
+    [ValidateSet('subscription','resourcegroup', 'resourcegroup-with-subscriptionowner')]
+    [string]$DeploymentType,
+
+    [Parameter(Mandatory=$true)]
+    [string]$SubscriptionId,
+
+    [string]$ResourceGroupName = "",
+
+    [string[]]$PreferredLocation = @(),
+
+    [string[]]$AllowedEntraUserIds = @()
+)
+
+. (Join-Path $PSScriptRoot 'quota-helpers.ps1')
+
+# Validate parameters
+if($DeploymentType -in @('resourcegroup', 'resourcegroup-with-subscriptionowner') -and [string]::IsNullOrEmpty($ResourceGroupName)) {
+    throw "ResourceGroupName must be provided for a resource-group deployment."
+}
+
+if($AllowedEntraUserIds.Count -eq 0) {
+    throw "AllowedEntraUserIds must contain at least one participant object ID."
+}
+
+$PreferredLocation = @($PreferredLocation | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+$stableHash = Get-MhhStableHash -Value $AllowedEntraUserIds -Length 24
+if($DeploymentType -eq 'subscription') {
+    $ResourceGroupName = "rg-sovereign-$($stableHash.Substring(0, 8))"
+}
+
+# set the effective location (used as the metadata location for the subscription-scoped deployment)
+if($PreferredLocation.Count -gt 0) {
+    $deploymentLocations = $PreferredLocation
+} else {
+    $deploymentLocations = @('swedencentral')
+}
+
+$selection = Get-MhhConfidentialComputeSelection -SubscriptionId $SubscriptionId
+$validCandidates = @(Get-MhhConfidentialComputeCandidates -PreferredLocation $deploymentLocations)
+$selectedCandidate = $validCandidates |
+    Where-Object {
+        $_.Location -ieq $selection.Location -and
+        $_.VmSize -ieq $selection.VmSize -and
+        $_.QuotaName -ieq $selection.QuotaName
+    } |
+    Select-Object -First 1
+if(-not $selectedCandidate) {
+    throw 'The shared subscription preparation did not persist a valid confidential compute selection for this deployment.'
+}
+
+$confidentialVmSize = $selectedCandidate.VmSize
+$confidentialQuotaName = $selectedCandidate.QuotaName
+$deploymentLocations = @($selectedCandidate.Location)
+$quotaRequirements = @(Get-MhhSovereignComputeRequirements -ConfidentialQuotaName $confidentialQuotaName)
+$regionReadinessSummary = @()
+foreach($candidateLocation in $deploymentLocations) {
+    $requiredVmSizes = @($confidentialVmSize, 'Standard_D4s_v5')
+    $availableVmSizes = Get-AzComputeResourceSku -Location $candidateLocation -ErrorAction Stop |
+        Where-Object {
+            $_.ResourceType -ieq 'virtualMachines' -and
+            $_.Name -iin $requiredVmSizes -and
+            -not ($_.Restrictions | Where-Object { $_.Type -ieq 'Location' })
+        } |
+        Select-Object -ExpandProperty Name -Unique
+    $unavailableVmSizes = @($requiredVmSizes | Where-Object { $_ -inotin $availableVmSizes })
+
+    if($unavailableVmSizes.Count -gt 0) {
+        $regionReadinessSummary += "${candidateLocation}: unavailable VM sizes $($unavailableVmSizes -join ', ')"
+        continue
+    }
+
+    $regionalUsage = Get-AzVMUsage -Location $candidateLocation -ErrorAction Stop
+    foreach($requirement in $quotaRequirements) {
+        $quota = $regionalUsage |
+            Where-Object { $_.Name.Value -ieq $requirement.Name } |
+            Select-Object -First 1
+        $current = if($null -eq $quota) { 0 } else { $quota.CurrentValue }
+        $limit = if($null -eq $quota) { 0 } else { $quota.Limit }
+        $available = $limit - $current
+        $regionReadinessSummary += "${candidateLocation}/$($requirement.Name): ${current}/${limit} vCPUs used"
+
+        if($available -lt $requirement.PerParticipant) {
+            throw "The shared compute selection is no longer ready ($($regionReadinessSummary -join '; ')). $($requirement.PerParticipant) available $($requirement.Name) vCPUs are required per participant."
+        }
+    }
+}
+
+$effectiveLocation = $deploymentLocations[0]
+
+# With deploymentType = resourcegroup the platform has already created one resource
+# group per participant in the shared subscription and granted the participant Owner
+# on it. In subscription mode this script creates a stable resource group instead.
+@{"HackboxCredential" = @{ name = "Resource Group Name"; value = $ResourceGroupName; note = "Your dedicated resource group (you have Owner)" }}
+
+# Provider registration is initiated once per subscription by shared-deploy-lab.ps1.
+# Registration is asynchronous, so verify the providers required by the shared lab.
+$sovereignLabProviders = @(
+    'Microsoft.Compute',
+    'Microsoft.ContainerInstance',
+    'Microsoft.ContainerRegistry',
+    'Microsoft.ContainerService',
+    'Microsoft.ManagedIdentity',
+    'Microsoft.Network'
+)
+foreach($providerNamespace in $sovereignLabProviders) {
+    $registered = $false
+    for($attempt = 1; $attempt -le 30; $attempt++) {
+        Update-MhhToken | Out-Null
+        $provider = Get-AzResourceProvider -ProviderNamespace $providerNamespace -ErrorAction Stop
+        if($provider.RegistrationState -eq 'Registered') {
+            $registered = $true
+            break
+        }
+        Write-Host "Waiting for $providerNamespace registration ($attempt/30)..."
+        Start-Sleep -Seconds 10
+    }
+    if(-not $registered) {
+        throw "Resource provider $providerNamespace did not reach Registered state within 5 minutes."
+    }
+}
+
+# Deploy the shared Sovereign Cloud topology first. The helper recreates the resource group
+# on retries, so subscription and resource-group role assignments are applied after it.
+$nameSuffix = $stableHash.Substring(0, 8)
+$k3sAdminPassword = New-MhhStablePassword -Purpose 'adaptive-apps-k3s-admin' -Length 24
+
+Write-Host "Deploying the shared Sovereign Cloud platform for Challenges 5 and 7..."
+$sovereignLabResult = Invoke-MhhDeploymentWithRegionFallback `
+    -PreferredLocations      $deploymentLocations `
+    -ResourceGroupName       $ResourceGroupName `
+    -RgOwnerEntraObjectIds   $AllowedEntraUserIds `
+    -TemplateFile            (Join-Path $PSScriptRoot 'sovereign-lab.bicep') `
+    -TemplateParameterObject @{
+        nameSuffix = $nameSuffix
+        adminPassword = $k3sAdminPassword
+        confidentialVmSize = $confidentialVmSize
+    } `
+    -DeploymentNamePrefix    'sovereign-lab' `
+    -Tag                     @{
+        workload = 'sovereign-lab'
+        challenges = '5,7'
+        CostControl = 'Ignore'
+    }
+
+# Assign the lab-specific subscription-scoped RBAC (Security Reader + Resource Policy
+# Contributor) and resource-group roles after region fallback has recreated the RG.
+$deploymentName = "lab-$stableHash"
+
+Write-Host "Assigning subscription-scoped lab RBAC to participant $($AllowedEntraUserIds[0])..."
+New-AzSubscriptionDeployment `
+    -Name                    $deploymentName `
+    -Location                $effectiveLocation `
+    -TemplateFile            (Join-Path $PSScriptRoot 'main.bicep') `
+    -TemplateParameterObject @{
+        userObjectId = $AllowedEntraUserIds[0]
+        resourceGroupName = $ResourceGroupName
+    } | Out-Null
+
+@{"HackboxCredential" = @{ name = "Sovereign Lab Region"; value = $sovereignLabResult.LocationUsed; note = "Region selected after capacity checks" }}
+@{"HackboxCredential" = @{ name = "AKS Confidential Node Size"; value = $confidentialVmSize; note = "Two Ubuntu AMD SEV-SNP nodes; four confidential vCPUs per participant" }}
+@{"HackboxCredential" = @{ name = "Sovereign Lab AKS Cluster"; value = $sovereignLabResult.Outputs.aksClusterName; note = "Shared by Challenges 5 and 7" }}
+@{"HackboxCredential" = @{ name = "AKS Confidential Node Pool"; value = $sovereignLabResult.Outputs.confidentialNodePoolName; note = "Challenge 5" }}
+@{"HackboxCredential" = @{ name = "Sovereign Lab K3s VM"; value = $sovereignLabResult.Outputs.k3sVmName; note = "Private local/edge execution environment" }}
+@{"HackboxCredential" = @{ name = "Sovereign Lab Bastion"; value = $sovereignLabResult.Outputs.bastionName; note = "Shared private access path" }}
+@{"HackboxCredential" = @{ name = "K3s VM Admin Username"; value = "azureuser"; note = $sovereignLabResult.Outputs.k3sVmName }}
+@{"HackboxCredential" = @{ name = "K3s VM Admin Password"; value = $k3sAdminPassword; note = $sovereignLabResult.Outputs.k3sVmName }}
+@{"HackboxCredential" = @{ name = "K3s NAT Egress IP"; value = $sovereignLabResult.Outputs.natEgressIp; note = "Deterministic outbound address" }}

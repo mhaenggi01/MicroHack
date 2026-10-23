@@ -1,0 +1,512 @@
+<#
+.SYNOPSIS
+    Deploys the Azure AI Foundry project and model deployment for the
+    Agentic Inventory Planning MicroHack.
+
+.DESCRIPTION
+    Called by the EMEA MicroHack platform once per attendee, in parallel.
+    Provisions:
+      - Azure AI Services account (AIServices kind — this is the Foundry account)
+      - Azure AI Foundry project inside the account
+      - gpt-5.4-mini model deployment (capacity 200 GlobalStandard = 200K TPM)
+      - A per-attendee Fabric capacity (default F4; -FabricSkuName to override), with the attendee set as capacity admin
+      - Application Insights (+ Log Analytics) connected to the project for agent tracing
+    
+    Each attendee gets their OWN Fabric capacity (no shared backend, no shared
+    Spark contention). The attendee then creates a workspace, assigns it to their
+    capacity, and Run All's the setup notebook themselves (Challenge 1) to load the
+    data and publish their own Fabric Data Agent.
+
+    Returns to the attendee dashboard:
+      - Foundry project endpoint (format: https://{name}.services.ai.azure.com/api/projects/{proj})
+      - Model deployment name
+      - The name of their Fabric capacity (used when they create their workspace)
+
+    The platform pre-sets the Az context to $SubscriptionId. For 'resourcegroup'
+    deployments it also pre-creates the resource group; for 'subscription'
+    deployments this script creates the resource group itself. Do NOT call
+    Connect-AzAccount.
+
+.PARAMETER DeploymentType
+    Deployment scope — passed in by the platform.
+
+.PARAMETER SubscriptionId
+    Azure subscription — passed in by the platform.
+
+.PARAMETER ResourceGroupName
+    Pre-created resource group — passed in by the platform.
+
+.PARAMETER PreferredLocation
+    Ordered list of preferred Azure regions — passed in by the platform.
+
+.PARAMETER AllowedEntraUserIds
+    Entra user object IDs for this lab — passed in by the platform.
+
+.PARAMETER FabricSkuName
+    Per-attendee Fabric capacity SKU (default F4). Drop to F2 to halve cost if
+    attendees don't hit capacity throttling. If you change it, ALSO adjust
+    estimatedDailyCostsUsd in lab-defaults.json to match — Fabric is the dominant
+    cost and each SKU step roughly doubles it.
+#>
+param(
+    [Parameter(Mandatory=$true)]
+    [ValidateSet('subscription','resourcegroup','resourcegroup-with-subscriptionowner')]
+    [string]$DeploymentType,
+
+    [Parameter(Mandatory=$true)]
+    [string]$SubscriptionId,
+
+    [string]$ResourceGroupName = "",
+
+    [string[]]$PreferredLocation = @(),
+
+    [string[]]$AllowedEntraUserIds = @(),
+
+    # Per-attendee Fabric capacity SKU. Default F4 avoids capacity throttling; drop
+    # to F2 to halve cost. If you change this, ALSO adjust estimatedDailyCostsUsd
+    # in lab-defaults.json (Fabric is the dominant cost; each SKU step roughly
+    # doubles it).
+    [ValidateSet('F2','F4','F8','F16','F32','F64')]
+    [string]$FabricSkuName = "F4"
+)
+
+$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$ErrorActionPreference = "Stop"
+
+# Resolve effective values — honour $PreferredLocation, fall back across the list
+$candidateRegions   = if ($PreferredLocation.Count -gt 0) { $PreferredLocation } else { @("swedencentral", "westeurope", "norwayeast") }
+$effectiveLocation  = $candidateRegions[0]
+$effectiveRG        = $ResourceGroupName
+
+if ($AllowedEntraUserIds.Count -eq 0) {
+    throw "At least one attendee object ID must be supplied in AllowedEntraUserIds."
+}
+$stableHash = (Get-MhhStableHash $AllowedEntraUserIds -Length 12).ToLower()
+
+# For 'subscription' deployments the platform does NOT pre-create a resource group
+# ($ResourceGroupName arrives empty). Create one ourselves with a deterministic,
+# per-attendee name so the rest of this (RG-scoped) script works unchanged.
+if ([string]::IsNullOrWhiteSpace($effectiveRG)) {
+    $effectiveRG = "rg-inv-hack-$stableHash"
+    if (-not (Get-AzResourceGroup -Name $effectiveRG -ErrorAction SilentlyContinue)) {
+        New-AzResourceGroup -Name $effectiveRG -Location $effectiveLocation | Out-Null
+        Write-Host "[OK]    Created resource group '$effectiveRG' (subscription deployment)."
+    }
+}
+
+# Foundry account name = custom subdomain name (must be globally unique)
+# Pattern: inv-{12-char hash} keeps it short and DNS-safe (Get-MhhStableHash minimum length is 12)
+$foundryAccountName = "inv-$stableHash"
+$foundryProjectName = "inventory-hack"
+$modelDeployment    = "gpt-5.4-mini"
+
+# Per-attendee Fabric capacity name (lowercase alphanumeric, 3-63 chars).
+$fabricCapacityName = "invcap$stableHash"
+
+Write-Host "[INFO]  Deploying Foundry account '$foundryAccountName' in '$effectiveRG'..."
+
+# ---------------------------------------------------------------------------
+# Azure AI Services account (this is the Foundry Hub)
+# Kind must be 'AIServices' — 'AIFoundry' is not a valid kind.
+# customSubDomainName = account name → enables {name}.services.ai.azure.com endpoint
+# ---------------------------------------------------------------------------
+$existingAccount = Get-AzResource `
+    -ResourceGroupName $effectiveRG `
+    -ResourceType "Microsoft.CognitiveServices/accounts" `
+    -Name $foundryAccountName `
+    -ErrorAction SilentlyContinue
+
+if ($existingAccount) {
+    $effectiveLocation = $existingAccount.Location
+    Write-Host "[OK]    Foundry account already exists in '$effectiveLocation' — skipping."
+} else {
+    $accountCreated = $false
+    foreach ($region in $candidateRegions) {
+        Write-Host "[INFO]  Attempting Foundry account in '$region'..."
+        # A system-assigned identity is REQUIRED before a project can be created
+        # ("To create projects, you must enable a managed identity on your resource").
+        $accountBody = @{
+            kind     = "AIServices"
+            sku      = @{ name = "S0" }
+            location = $region
+            identity = @{ type = "SystemAssigned" }
+            properties = @{
+                customSubDomainName = $foundryAccountName
+                publicNetworkAccess = "Enabled"
+                allowProjectManagement = $true
+            }
+        } | ConvertTo-Json -Depth 5
+
+        $accountUri = "/subscriptions/$SubscriptionId/resourceGroups/$effectiveRG" +
+            "/providers/Microsoft.CognitiveServices/accounts/$foundryAccountName" +
+            "?api-version=2025-04-01-preview"
+
+        # Invoke-AzRestMethod does NOT throw on non-2xx — inspect the status code.
+        $resp = Invoke-AzRestMethod -Method PUT -Path $accountUri -Payload $accountBody
+
+        # A soft-deleted account (48h retention) reserves the subdomain globally and
+        # blocks re-creation with HTTP 409 CustomDomainInUse. This is common when a lab
+        # is torn down and re-provisioned for the same attendee. Purge it and retry.
+        if ($resp.StatusCode -eq 409 -and $resp.Content -match 'CustomDomainInUse') {
+            Write-Warning "Subdomain '$foundryAccountName' is held by a soft-deleted account — purging and retrying."
+            $listResp = Invoke-AzRestMethod -Method GET -Path "/subscriptions/$SubscriptionId/providers/Microsoft.CognitiveServices/deletedAccounts?api-version=2025-04-01-preview"
+            if ($listResp.StatusCode -eq 200) {
+                foreach ($d in (($listResp.Content | ConvertFrom-Json).value | Where-Object { $_.name -eq $foundryAccountName })) {
+                    $delRg = if ($d.id -match '/resourceGroups/([^/]+)/deletedAccounts/') { $Matches[1] } else { $effectiveRG }
+                    Invoke-AzRestMethod -Method DELETE -Path "/subscriptions/$SubscriptionId/providers/Microsoft.CognitiveServices/locations/$($d.location)/resourceGroups/$delRg/deletedAccounts/${foundryAccountName}?api-version=2025-04-01-preview" | Out-Null
+                }
+                Start-Sleep -Seconds 5
+            }
+            $resp = Invoke-AzRestMethod -Method PUT -Path $accountUri -Payload $accountBody
+        }
+
+        if ($resp.StatusCode -ge 400) {
+            Write-Warning "Region '$region' rejected the account create (HTTP $($resp.StatusCode)): $($resp.Content) — trying next region."
+            continue
+        }
+
+        # Wait for provisioning (AIServices accounts can take several minutes).
+        $timeout = 300; $elapsed = 0; $acct = $null
+        do {
+            Start-Sleep -Seconds 10; $elapsed += 10
+            $acct = Get-AzResource -ResourceGroupName $effectiveRG -ResourceType "Microsoft.CognitiveServices/accounts" -Name $foundryAccountName -ErrorAction SilentlyContinue
+        } while (($acct.Properties.provisioningState -ne "Succeeded") -and ($elapsed -lt $timeout))
+
+        if ($acct.Properties.provisioningState -eq "Succeeded") {
+            $effectiveLocation = $region
+            $accountCreated = $true
+            Write-Host "[OK]    Foundry account created in '$region'."
+            break
+        }
+        Write-Warning "Provisioning did not succeed in '$region' within ${timeout}s — trying next region."
+    }
+    if (-not $accountCreated) {
+        throw "Could not create the Foundry account in any preferred region: $($candidateRegions -join ', ')"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Foundry project
+# ---------------------------------------------------------------------------
+$accountScope = "/subscriptions/$SubscriptionId/resourceGroups/$effectiveRG" +
+    "/providers/Microsoft.CognitiveServices/accounts/$foundryAccountName"
+$projectUri = "/subscriptions/$SubscriptionId/resourceGroups/$effectiveRG" +
+    "/providers/Microsoft.CognitiveServices/accounts/$foundryAccountName" +
+    "/projects/${foundryProjectName}?api-version=2025-04-01-preview"
+
+$projectBody = @{
+    location = $effectiveLocation
+    identity = @{ type = "SystemAssigned" }
+    properties = @{
+        description = "Agentic Inventory Planning MicroHack"
+        displayName = "Inventory Planning MicroHack"
+    }
+} | ConvertTo-Json -Depth 4
+
+$projectResponse = Invoke-AzRestMethod -Method PUT -Path $projectUri -Payload $projectBody
+if ($projectResponse.StatusCode -ge 400) {
+    throw "Foundry project create or update failed (HTTP $($projectResponse.StatusCode)): $($projectResponse.Content)"
+}
+
+$projectResource = $null
+$elapsed = 0
+do {
+    Start-Sleep -Seconds 8
+    $elapsed += 8
+    $projectResponse = Invoke-AzRestMethod -Method GET -Path $projectUri -ErrorAction SilentlyContinue
+    if ($projectResponse.StatusCode -eq 200) {
+        $projectResource = $projectResponse.Content | ConvertFrom-Json
+        if ($projectResource.properties.provisioningState -eq "Failed") {
+            throw "Foundry project provisioning failed: $($projectResponse.Content)"
+        }
+    }
+} while (
+    ($projectResponse.StatusCode -ne 200 -or
+     $projectResource.properties.provisioningState -ne "Succeeded" -or
+     -not $projectResource.identity.principalId) -and
+    ($elapsed -lt 180)
+)
+
+if ($projectResponse.StatusCode -ne 200 -or
+    $projectResource.properties.provisioningState -ne "Succeeded" -or
+    -not $projectResource.identity.principalId) {
+    throw "Foundry project did not reach Succeeded with a managed identity within 180 seconds. Last response: $($projectResponse.Content)"
+}
+Write-Host "[OK]    Foundry project '$foundryProjectName' is ready."
+
+# Foundry User (formerly Azure AI User) enables project access and agent operations.
+$foundryUserRoleId = "53ca6127-db72-4b80-b1b0-d745d6d5456d"
+
+function Grant-FoundryUserRole {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$PrincipalId,
+
+        [Parameter(Mandatory=$true)]
+        [string]$PrincipalDescription
+    )
+
+    $existingAssignment = Get-AzRoleAssignment `
+        -ObjectId $PrincipalId `
+        -Scope $accountScope `
+        -RoleDefinitionId $foundryUserRoleId `
+        -ErrorAction SilentlyContinue
+    if ($existingAssignment) {
+        Write-Host "[OK]    Foundry User already assigned to $PrincipalDescription."
+        return
+    }
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        try {
+            New-AzRoleAssignment `
+                -ObjectId $PrincipalId `
+                -RoleDefinitionId $foundryUserRoleId `
+                -Scope $accountScope `
+                -ErrorAction Stop | Out-Null
+            Write-Host "[OK]    Granted Foundry User to $PrincipalDescription."
+            return
+        } catch {
+            $lastError = $_
+            if ($attempt -lt 6) {
+                Start-Sleep -Seconds 10
+            }
+        }
+    }
+
+    throw "Could not grant Foundry User to $PrincipalDescription after 6 attempts: $lastError"
+}
+
+foreach ($userId in $AllowedEntraUserIds) {
+    Grant-FoundryUserRole -PrincipalId $userId -PrincipalDescription "attendee '$userId'"
+}
+Grant-FoundryUserRole `
+    -PrincipalId $projectResource.identity.principalId `
+    -PrincipalDescription "project managed identity '$($projectResource.identity.principalId)'"
+
+# ---------------------------------------------------------------------------
+# Application Insights for agent tracing (per attendee).
+# The Foundry portal Traces tab (and server-side tracing) only lights up once the
+# project is connected to an Application Insights resource. We create a
+# workspace-based App Insights and add it as an 'AppInsights' project connection so
+# attendees see agent + Fabric Data Agent traces in Challenges 3-5 with no manual
+# setup. Non-fatal: a failure here doesn't block the rest of the lab (attendees can
+# still connect one via Agents -> Traces -> Connect).
+# ---------------------------------------------------------------------------
+try {
+    foreach ($ns in 'Microsoft.OperationalInsights', 'Microsoft.Insights') {
+        $prov = Invoke-AzRestMethod -Method GET -Path "/subscriptions/$SubscriptionId/providers/$ns`?api-version=2021-04-01"
+        if ($prov.StatusCode -eq 200 -and ($prov.Content | ConvertFrom-Json).registrationState -ne 'Registered') {
+            Invoke-AzRestMethod -Method POST -Path "/subscriptions/$SubscriptionId/providers/$ns/register?api-version=2021-04-01" | Out-Null
+        }
+    }
+
+    $laName = "inv-la-$stableHash"
+    $aiName = "inv-appi-$stableHash"
+    $laId   = "/subscriptions/$SubscriptionId/resourceGroups/$effectiveRG/providers/Microsoft.OperationalInsights/workspaces/$laName"
+    $aiId   = "/subscriptions/$SubscriptionId/resourceGroups/$effectiveRG/providers/Microsoft.Insights/components/$aiName"
+
+    $laBody = @{ location = $effectiveLocation; properties = @{ sku = @{ name = 'PerGB2018' }; retentionInDays = 30 } } | ConvertTo-Json -Depth 5
+    $laResp = Invoke-AzRestMethod -Method PUT -Path "$laId`?api-version=2023-09-01" -Payload $laBody
+    if ($laResp.StatusCode -ge 400) { throw "Log Analytics workspace create failed (HTTP $($laResp.StatusCode)): $($laResp.Content)" }
+
+    # Workspace-based App Insights (classic is retired); WorkspaceResourceId links it to the Log Analytics workspace.
+    $aiBody = @{ location = $effectiveLocation; kind = 'web'; properties = @{ Application_Type = 'web'; WorkspaceResourceId = $laId } } | ConvertTo-Json -Depth 5
+    $aiResp = Invoke-AzRestMethod -Method PUT -Path "$aiId`?api-version=2020-02-02" -Payload $aiBody
+    if ($aiResp.StatusCode -ge 400) { throw "Application Insights create failed (HTTP $($aiResp.StatusCode)): $($aiResp.Content)" }
+
+    # ConnectionString populates asynchronously — poll briefly.
+    $aiConnString = $null
+    for ($i = 0; $i -lt 6 -and -not $aiConnString; $i++) {
+        Start-Sleep -Seconds 5
+        $aiConnString = ((Invoke-AzRestMethod -Method GET -Path "$aiId`?api-version=2020-02-02").Content | ConvertFrom-Json).properties.ConnectionString
+    }
+    if (-not $aiConnString) { throw "Application Insights connection string not available yet." }
+
+    # Connect App Insights to the project (category 'AppInsights') — same as the portal's Traces -> Connect.
+    $aiConnUri  = "/subscriptions/$SubscriptionId/resourceGroups/$effectiveRG/providers/Microsoft.CognitiveServices/accounts/$foundryAccountName/projects/$foundryProjectName/connections/appinsights?api-version=2025-04-01-preview"
+    $aiConnBody = @{ properties = @{
+        category      = 'AppInsights'
+        target        = $aiId
+        authType      = 'ApiKey'
+        isSharedToAll = $true
+        credentials   = @{ key = $aiConnString }
+        metadata      = @{ ApiType = 'Azure'; ResourceId = $aiId }
+    } } | ConvertTo-Json -Depth 6
+    $aiConnResp = Invoke-AzRestMethod -Method PUT -Path $aiConnUri -Payload $aiConnBody
+    if ($aiConnResp.StatusCode -ge 400) { throw "App Insights project connection failed (HTTP $($aiConnResp.StatusCode)): $($aiConnResp.Content)" }
+
+    Write-Host "[OK]    Application Insights '$aiName' connected to the project for agent tracing."
+} catch {
+    Write-Warning "Application Insights tracing setup skipped: $_ - attendees can still connect one manually (Agents -> Traces -> Connect)."
+}
+
+# ---------------------------------------------------------------------------
+# gpt-5.4-mini model deployment (ACCOUNT-scoped, GlobalStandard capacity 200).
+# Matches the pro-code inventory hack: a low-cost GPT-5 model whose Foundry model
+# card confirms Functions/Tools + Structured Outputs, on GlobalStandard in EU
+# regions, with the longest support horizon among the low-cost models
+# (retires 2027-03-18; gpt-4o-mini / gpt-4.1-mini retire Oct 2026).
+#
+# gpt-5.4-mini is a GPT-5 *reasoning* model. In the Foundry tool picker the Fabric
+# Data Agent tool may show "Not supported by the selected model" - that flag is
+# cosmetic; the tool still runs via the Responses API. If an agent skips the
+# Fabric tool, set tool choice = required in the run settings (the challenge
+# instructions carry an "IMPORTANT - tool use" block for exactly this).
+#
+# Capacity 200 = 200K TPM per attendee. Keep labsPerSubscription x 200 <= the
+# region's GlobalStandard quota (~1,000). At 5 labs/subscription that is 5 x 200 =
+# 1,000, i.e. right at the ceiling - request a quota increase, or use one
+# subscription per attendee, if attendees hit rate limits.
+# Model deployments are ACCOUNT-scoped (not project-scoped): the ARM path is
+# .../accounts/{account}/deployments/{deployment} - there is no /projects/ segment.
+# ---------------------------------------------------------------------------
+$deploymentUri = "/subscriptions/$SubscriptionId/resourceGroups/$effectiveRG" +
+    "/providers/Microsoft.CognitiveServices/accounts/$foundryAccountName" +
+    "/deployments/$modelDeployment" +
+    "?api-version=2025-04-01-preview"
+
+$existingDeploy = Invoke-AzRestMethod -Method GET -Path $deploymentUri -ErrorAction SilentlyContinue
+if ($existingDeploy.StatusCode -ne 200) {
+    $deploymentBody = @{
+        sku        = @{ name = "GlobalStandard"; capacity = 200 }
+        properties = @{
+            model = @{ format = "OpenAI"; name = "gpt-5.4-mini"; version = "2026-03-17" }
+        }
+    } | ConvertTo-Json -Depth 10
+
+    try {
+        Invoke-AzRestMethod -Method PUT -Path $deploymentUri -Payload $deploymentBody | Out-Null
+        Write-Host "[OK]    Model deployment '$modelDeployment' initiated."
+    } catch {
+        Write-Host "[WARN]  Model deployment: $_ — may already exist, continuing."
+    }
+} else {
+    Write-Host "[OK]    Model deployment already exists — skipping."
+}
+
+# ---------------------------------------------------------------------------
+# Per-attendee Fabric capacity (ARM REST — no az CLI / Fabric extension needed).
+# The attendee is set as capacity ADMIN so they can create a workspace, assign it
+# to this capacity, and Run All the setup notebook themselves (Challenge 1).
+# Default F4 = 4 CU; a 512-CU subscription supports ~128 attendees. Drop to F2 (2 CU)
+# to double attendees/subscription and halve cost — override with -FabricSkuName and
+# adjust estimatedDailyCostsUsd in lab-defaults.json to match.
+#
+# Capacity admin members must be UPNs (or service principals) — bare object IDs are
+# rejected — so resolve each attendee object ID to a UPN with the platform helper
+# Get-MhhLabUser. It is served from a platform-seeded cache (no Microsoft Graph
+# permission needed on the deploying service principal) and falls back to
+# Get-AzADUser transparently when run locally.
+# ---------------------------------------------------------------------------
+$fabricCapacityRegion = $null
+$adminUpns = @()
+foreach ($uid in $AllowedEntraUserIds) {
+    try {
+        $u = Get-MhhLabUser -UserId $uid -ErrorAction Stop
+        if ($u.UserPrincipalName) { $adminUpns += $u.UserPrincipalName }
+    } catch {
+        Write-Warning "Could not resolve attendee object ID '$uid' to a UPN via Get-MhhLabUser: $_"
+    }
+}
+
+if ($adminUpns.Count -eq 0) {
+    Write-Warning "No attendee UPNs resolved — skipping Fabric capacity creation. Create the capacity manually and set the attendee as capacity admin, or re-run once the lab-user cache is available."
+} else {
+    # Ensure the Microsoft.Fabric resource provider is registered (idempotent).
+    $prov = Invoke-AzRestMethod -Method GET -Path "/subscriptions/$SubscriptionId/providers/Microsoft.Fabric?api-version=2021-04-01"
+    if ($prov.StatusCode -eq 200 -and ($prov.Content | ConvertFrom-Json).registrationState -ne "Registered") {
+        Invoke-AzRestMethod -Method POST -Path "/subscriptions/$SubscriptionId/providers/Microsoft.Fabric/register?api-version=2021-04-01" | Out-Null
+    }
+
+    $capExists = Get-AzResource -ResourceGroupName $effectiveRG -ResourceType "Microsoft.Fabric/capacities" -Name $fabricCapacityName -ErrorAction SilentlyContinue
+    if ($capExists) {
+        $fabricCapacityRegion = $capExists.Location
+        Write-Host "[OK]    Fabric capacity '$fabricCapacityName' already exists in '$fabricCapacityRegion' — skipping."
+    } else {
+        foreach ($region in $candidateRegions) {
+            Write-Host "[INFO]  Creating Fabric $FabricSkuName capacity '$fabricCapacityName' in '$region'..."
+            $capBody = @{
+                location   = $region
+                sku        = @{ name = $FabricSkuName; tier = "Fabric" }
+                properties = @{ administration = @{ members = @($adminUpns) } }
+            } | ConvertTo-Json -Depth 6
+            $capUri = "/subscriptions/$SubscriptionId/resourceGroups/$effectiveRG" +
+                "/providers/Microsoft.Fabric/capacities/$fabricCapacityName" +
+                "?api-version=2023-11-01"
+            $capResp = Invoke-AzRestMethod -Method PUT -Path $capUri -Payload $capBody
+            if ($capResp.StatusCode -ge 400) {
+                Write-Warning "Fabric capacity create in '$region' failed (HTTP $($capResp.StatusCode)): $($capResp.Content) — trying next region."
+                continue
+            }
+            $elapsed = 0; $cap = $null
+            do {
+                Start-Sleep -Seconds 10; $elapsed += 10
+                $cap = Get-AzResource -ResourceGroupName $effectiveRG -ResourceType "Microsoft.Fabric/capacities" -Name $fabricCapacityName -ErrorAction SilentlyContinue
+            } while (($cap.Properties.provisioningState -ne "Succeeded") -and ($elapsed -lt 180))
+            if ($cap.Properties.provisioningState -eq "Succeeded") {
+                $fabricCapacityRegion = $region
+                Write-Host "[OK]    Fabric $FabricSkuName capacity '$fabricCapacityName' created in '$region'."
+                break
+            }
+            Write-Warning "Fabric capacity provisioning did not succeed in '$region' — trying next region."
+        }
+        if (-not $fabricCapacityRegion) {
+            Write-Warning "Could not create the Fabric capacity in any preferred region (check Fabric F-SKU quota). The attendee can still do the Foundry steps; provision Fabric manually."
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Return credentials to the attendee dashboard
+# ---------------------------------------------------------------------------
+$tenantId        = (Get-AzContext).Tenant.Id
+$projectEndpoint = "https://$foundryAccountName.services.ai.azure.com/api/projects/$foundryProjectName"
+
+# Clickable Foundry portal deep-link to THIS project. The ai.azure.com portal encodes the
+# subscription GUID as a base64url token (in string/hex byte order — NOT Guid.ToByteArray()),
+# followed by <rg>,,<account>,<project>. Giving attendees this link means they don't have to
+# hunt for their project in the portal.
+$subHex   = $SubscriptionId -replace '-', ''
+$subBytes = for ($i = 0; $i -lt $subHex.Length; $i += 2) { [Convert]::ToByte($subHex.Substring($i, 2), 16) }
+$subToken = [Convert]::ToBase64String([byte[]]$subBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+$projectPortalUrl = "https://ai.azure.com/nextgen/r/$subToken,$effectiveRG,,$foundryAccountName,$foundryProjectName/home?tid=$tenantId"
+$fabricPortalUrl  = "https://app.fabric.microsoft.com/home?tid=$tenantId"
+
+Write-Host "[OK]    Lab provisioning complete."
+
+@{ HackboxCredential = @{
+    name  = "FoundryProjectUrl"
+    value = $projectPortalUrl
+    note  = "Open your Foundry project directly (sign in with your lab user). This is where you build the agents in Challenges 2-5."
+} }
+
+@{ HackboxCredential = @{
+    name  = "FoundryProjectEndpoint"
+    value = $projectEndpoint
+    note  = "SDK / API endpoint for your project (optional - the hack is done in the portal via FoundryProjectUrl)"
+} }
+
+@{ HackboxCredential = @{
+    name  = "ModelDeploymentName"
+    value = $modelDeployment
+    note  = "Select this model when creating agents in the Foundry portal"
+} }
+
+@{ HackboxCredential = @{
+    name  = "FabricCapacityName"
+    value = $fabricCapacityName
+    note  = "Your own Fabric $FabricSkuName capacity. In Challenge 1 you create a workspace and assign it to this capacity, then Run All the setup notebook to publish your Data Agent."
+} }
+
+@{ HackboxCredential = @{
+    name  = "FabricPortalUrl"
+    value = $fabricPortalUrl
+    note  = "Open the Fabric portal (sign in with your lab user) to create your workspace on your FabricCapacityName in Challenge 1. Your workspace URL doesn't exist until you create it there."
+} }
+
+@{ HackboxCredential = @{
+    name  = "ResourceGroupName"
+    value = $effectiveRG
+    note  = "The resource group containing your Foundry account and Fabric capacity — find your resources here in the Azure portal"
+} }

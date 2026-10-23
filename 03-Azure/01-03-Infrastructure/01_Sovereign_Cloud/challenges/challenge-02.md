@@ -1,0 +1,31 @@
+# Challenge 2 - Encryption at Rest with Customer-Managed Keys (CMKs) in Azure Key Vault
+
+## Goal
+
+Understand Customer-Managed Keys in Azure Key Vault. Configure an Azure Storage account to use a customer-managed key stored in Azure Key Vault (or Azure Managed HSM) for encryption at rest. Validate the configuration and understand operational considerations for sovereign scenarios.
+
+## Actions
+
+* Understand Azure Key Management Options
+* Understand Customer-Managed Keys (CMK) in Azure Key Vault
+* CMK for Azure Storage - Implementation Step by Step
+* Understand soft-delete retention and purge protection.
+* Verify client and Storage-service access to Key Vault.
+* Create or reuse a Log Analytics workspace and enable Key Vault audit logs.
+
+## Success criteria
+
+* You have deployed Azure Key Vault
+* You successfully implement CMK for an Azure Storage account using Azure CLI.
+* You have successfully verified encryption settings
+* You understand how deleted keys can be recovered during retention and have verified a new key-operation audit event in Log Analytics.
+
+## Learning resources
+
+* [Customer-managed keys for Azure Storage encryption](https://learn.microsoft.com/azure/storage/common/customer-managed-keys-overview)
+* [About Azure Key Vault](https://learn.microsoft.com/azure/key-vault/general/overview)
+* [Azure Key Vault keys, secrets, and certificates overview](https://learn.microsoft.com/azure/key-vault/general/about-keys-secrets-certificates)
+* [Azure Key Vault basic concepts](https://learn.microsoft.com/azure/key-vault/general/basic-concepts)
+* [What is Azure Key Vault Managed HSM?](https://learn.microsoft.com/azure/key-vault/managed-hsm/overview)
+* [Azure Key & Certificate Management](https://learn.microsoft.com/azure/key-vault/general/overview)
+* [Services that support CMKs with Key Vault & Managed HSM](https://learn.microsoft.com/azure/security/fundamentals/encryption-customer-managed-keys-support)
